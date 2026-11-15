@@ -1,0 +1,5 @@
+# 统一 LF: 这个仓库里有 Dockerfile / entrypoint, 混进 CRLF 会让镜像构建或容器启动莫名失败
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.gz binary
