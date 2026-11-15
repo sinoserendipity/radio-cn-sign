@@ -5,7 +5,7 @@
 给 `ytcast2.radio.cn` 的广播 m3u8 自动签名 + 自动续签的代理，跑起来就能用固定地址收听：
 
 ```
-http://<宿主机IP>:8090/m3u8?url=http://ytcast2.radio.cn/index_40639.m3u8
+http://<宿主机IP>:7680/m3u8?url=http://ytcast2.radio.cn/index_40639.m3u8
 ```
 
 （容器内监听 8090，宿主机端口随便映射；被占用就改 `ports:` 左边。）
@@ -64,7 +64,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d  # 从源
 
 ```bash
 docker run -d --name radio-cn-sign --restart unless-stopped \
-  -p 8091:8090 \
+  -p 7680:8090 \
   -e SIGN_KEY='<你的 SIGN_KEY>' \
   ghcr.io/sinoserendipity/radio-cn-sign:latest
 ```
