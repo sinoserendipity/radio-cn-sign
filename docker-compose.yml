@@ -11,7 +11,7 @@ services:
     network_mode: bridge
     ports:
       # 宿主机端口:容器端口。7680 是当前部署用的宿主端口
-      - "7680:8090"
+      - "7680:7680"
     environment:
       # 由同目录 .env 提供(参考 .env.example); 不要写死在这里, 更不要提交
       SIGN_KEY: "${SIGN_KEY:?set SIGN_KEY in .env}"

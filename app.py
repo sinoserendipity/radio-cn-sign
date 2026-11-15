@@ -4,7 +4,7 @@
 radio.cn (云听/央广) HLS 签名代理 —— 纯标准库实现，零依赖。
 
 播放地址形如:
-    http://<host>:8090/m3u8?url=http://ytcast2.radio.cn/index_40639.m3u8
+    http://<host>:7680/m3u8?url=http://ytcast2.radio.cn/index_40639.m3u8
 
 工作方式:
     1. 从请求的 url 中取出切片索引名 (index_40639.m3u8);
@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # ---------------------------------------------------------------- 配置
 SIGN_KEY = (os.environ.get("SIGN_KEY") or os.environ.get("RADIO_CN_SIGN_KEY") or "").strip()
 API_BASE = (os.environ.get("API_BASE") or "https://ytmsout.radio.cn").rstrip("/")
-PORT = int(os.environ.get("PORT") or 8090)
+PORT = int(os.environ.get("PORT") or 7680)
 BIND = os.environ.get("BIND") or "0.0.0.0"
 CATALOG_TTL = int(os.environ.get("CATALOG_TTL") or 900)   # 全量频道表刷新间隔(秒)
 RESIGN_WINDOW = int(os.environ.get("RESIGN_WINDOW") or 30)  # 同一频道复用已签地址的最长时间(秒)
@@ -367,7 +367,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": False,
                 "error": "缺少 url 参数",
                 "example": "http://%s/m3u8?url=http://ytcast2.radio.cn/index_40639.m3u8"
-                           % (self.headers.get("Host") or "127.0.0.1:8090"),
+                           % (self.headers.get("Host") or "127.0.0.1:7680"),
             }, head=head)
         started = time.time()
         try:
@@ -433,7 +433,7 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_stations(self, raw_qs: str, head=False):
         q = urllib.parse.parse_qs(raw_qs or "")
         prov = (q.get("province") or [""])[0]
-        base = "http://%s/m3u8?url=" % (self.headers.get("Host") or "127.0.0.1:8090")
+        base = "http://%s/m3u8?url=" % (self.headers.get("Host") or "127.0.0.1:7680")
         try:
             rows = CATALOG.all_stations()
         except Exception as e:  # noqa: BLE001
@@ -455,7 +455,7 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_m3u(self, raw_qs: str, head=False):
         q = urllib.parse.parse_qs(raw_qs or "")
         prov = (q.get("province") or [""])[0]
-        base = "http://%s/m3u8?url=" % (self.headers.get("Host") or "127.0.0.1:8090")
+        base = "http://%s/m3u8?url=" % (self.headers.get("Host") or "127.0.0.1:7680")
         try:
             rows = CATALOG.all_stations()
         except Exception as e:  # noqa: BLE001
@@ -483,7 +483,7 @@ INDEX_HTML = """<!doctype html><meta charset="utf-8"><title>radio.cn 签名代�
 <style>body{font:15px/1.7 -apple-system,"Microsoft YaHei",sans-serif;margin:40px;max-width:820px}
 code{background:#f3f3f3;padding:2px 5px;border-radius:4px}</style>
 <h2>radio.cn 云听 HLS 签名代理</h2>
-<p>用法:<br><code>http://HOST:8090/m3u8?url=http://ytcast2.radio.cn/index_40639.m3u8</code></p>
+<p>用法:<br><code>http://HOST:7680/m3u8?url=http://ytcast2.radio.cn/index_40639.m3u8</code></p>
 <p>可选参数:<code>&amp;mode=redirect</code> 返回 302 直连 CDN;默认代理播放列表并自动续签。</p>
 <p><a href="/stations">/stations</a> 频道列表 · <a href="/radio.m3u">/radio.m3u</a> M3U 订阅 ·
 <a href="/healthz">/healthz</a> 健康检查</p>

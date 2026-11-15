@@ -8,7 +8,7 @@
 http://<宿主机IP>:7680/m3u8?url=http://ytcast2.radio.cn/index_40639.m3u8
 ```
 
-（容器内监听 8090，宿主机端口随便映射；被占用就改 `ports:` 左边。）
+（容器内外统一用 **7680**；要换端口需同时改 `docker-compose.yml` 的 `ports:` 和 Dockerfile 的 `PORT`。）
 
 ## 为什么需要它
 
@@ -64,7 +64,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d  # 从源
 
 ```bash
 docker run -d --name radio-cn-sign --restart unless-stopped \
-  -p 7680:8090 \
+  -p 7680:7680 \
   -e SIGN_KEY='<你的 SIGN_KEY>' \
   ghcr.io/sinoserendipity/radio-cn-sign:latest
 ```
@@ -99,7 +99,7 @@ docker load -i radio-cn-sign-amd64.tar.gz     # 或 arm64
 |---|---|---|
 | `SIGN_KEY` | （必填） | 网页端接口签名密钥 |
 | `API_BASE` | `https://ytmsout.radio.cn` | 备用网关 `https://ytmsotherout.radio.cn` |
-| `PORT` / `BIND` | `8090` / `0.0.0.0` | 容器内监听 |
+| `PORT` / `BIND` | `7680` / `0.0.0.0` | 容器内监听 |
 | `RESIGN_WINDOW` | `30` | 同一频道复用已签地址的最长秒数（每次超时就重新请求网关） |
 | `CATALOG_TTL` | `900` | 全量频道表刷新间隔（32 个地区 × 1 次请求） |
 | `UPSTREAM_TIMEOUT` | `8` | 上游超时秒数 |

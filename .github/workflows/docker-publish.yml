@@ -93,7 +93,7 @@ jobs:
           echo "smoke testing $tag"
           trap 'docker rm -f radio-smoke >/dev/null 2>&1 || true' EXIT
           # SIGN_KEY 只影响上游签名, /healthz 不需要真实密钥
-          docker run -d --name radio-smoke -p 18090:8090 -e SIGN_KEY=smoke-test-not-a-real-key "$tag" >/dev/null
+          docker run -d --name radio-smoke -p 18090:7680 -e SIGN_KEY=smoke-test-not-a-real-key "$tag" >/dev/null
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:18090/healthz >/dev/null 2>&1; then
               curl -fsS http://127.0.0.1:18090/healthz
@@ -156,7 +156,7 @@ jobs:
           set -euo pipefail
           tag="${{ env.IMAGE_NAME }}:tarball-amd64"
           trap 'docker rm -f radio-smoke >/dev/null 2>&1 || true' EXIT
-          docker run -d --name radio-smoke -p 18090:8090 -e SIGN_KEY=smoke-test-not-a-real-key "$tag" >/dev/null
+          docker run -d --name radio-smoke -p 18090:7680 -e SIGN_KEY=smoke-test-not-a-real-key "$tag" >/dev/null
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:18090/healthz >/dev/null 2>&1; then
               curl -fsS http://127.0.0.1:18090/healthz
