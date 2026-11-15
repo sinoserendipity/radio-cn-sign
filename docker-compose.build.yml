@@ -1,0 +1,12 @@
+# 从源码构建本机镜像（需要 Dockerfile 和这个文件放在同一目录）：
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+#
+# 单独的 up 故意不带 build:，避免在"只拷了 compose 文件"的目录里
+# 报 "failed to read dockerfile: open Dockerfile: no such file or directory"。
+services:
+  radio-cn-sign:
+    image: radio-cn-sign:local
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: Dockerfile

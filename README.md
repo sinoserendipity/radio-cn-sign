@@ -53,9 +53,12 @@ cp .env.example .env    # 然后填 SIGN_KEY
 ### 2. docker compose（推荐）
 
 ```bash
-docker compose up -d          # 直接用 CI 构建好的镜像
-docker compose up -d --build  # 或者本地从源码构建
+docker compose up -d                                                    # 用 CI 构建好的镜像
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d  # 从源码构建
 ```
+
+> `docker-compose.yml` 里**故意没有 `build:`**。同时写 `image:` 和 `build: .` 时，本地没有镜像的 compose 会优先去当前目录构建而不是拉取，换个目录部署就会报
+> `failed to read dockerfile: open Dockerfile: no such file or directory`。要构建请用上面第二条命令（带上 `docker-compose.build.yml`）。
 
 ### 3. 或者一条 docker run
 

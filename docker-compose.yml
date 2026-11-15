@@ -1,8 +1,10 @@
 services:
   radio-cn-sign:
-    build: .
-    # 默认用 CI 构建好的多架构镜像; 想从源码构建就 docker compose up -d --build
+    # 用 CI 构建好的多架构镜像。这里**故意不写 build:**——否则 compose 在本地没有镜像时
+    # 会去当前目录找 Dockerfile 构建，换个目录部署就报 "open Dockerfile: no such file"。
+    # 要从源码构建，见 docker-compose.build.yml。
     image: ghcr.io/sinoserendipity/radio-cn-sign:latest
+    pull_policy: always
     container_name: radio-cn-sign
     restart: unless-stopped
     # OpenWrt/iStoreOS 上 compose 自建 bridge 常无外网(DNS/转发问题), 用默认 bridge 最稳
