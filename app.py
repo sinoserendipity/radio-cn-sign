@@ -364,6 +364,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_stations(raw_qs, head)
         if path in ("/radio.m3u", "/list.m3u"):
             return self._handle_m3u(raw_qs, head)
+        if path == "/probe":
+            return self._handle_probe(raw_qs, head)
         if path in ("/m3u8", "/live", "/hls", "/play"):
             return self._handle_m3u8(raw_qs, head)
         return self._send(404, "404 not found\n", head=head)
@@ -451,6 +453,57 @@ class Handler(BaseHTTPRequestHandler):
         elif qs.startswith("id="):
             qs = qs[3:]
         return urllib.parse.unquote(qs.strip()), mode
+
+    # ---- /probe：告诉客户端「这个台现在是 HLS / 直连 mp3 / 没节目」
+    # hls.js 需要 m3u8；<audio> 能直接吃 mp3。而浏览器没法从 302 后的跨域响应里读类型，
+    # 所以由代理在这里判一次，客户端按 kind 选播放器。
+    def _handle_probe(self, raw_qs: str, head=False):
+        target, _mode = self._parse_m3u8_query(raw_qs)
+        if not target:
+            return self._send_json(400, {"ok": False, "error": "缺少 url 参数"}, head=head)
+        try:
+            signed, station = resolve_signed_url(target)
+        except LookupError as e:
+            return self._send_json(404, {"ok": False, "error": str(e)}, head=head)
+        except Exception as e:  # noqa: BLE001
+            return self._send_json(502, {"ok": False, "error": "签名失败: %s" % e}, head=head)
+
+        title = (station or {}).get("title") or ""
+        path = urllib.parse.urlparse(signed).path.lower()
+        play_url = "%s/m3u8?url=%s" % ("http://" + (self.headers.get("Host") or "127.0.0.1:7680"),
+                                       urllib.parse.quote(target, safe=""))
+        if path.endswith(".m3u8") or path.endswith(".m3u"):
+            try:
+                _st, _ct, body = fetch_upstream(signed)
+                if not body.strip():
+                    time.sleep(0.5)
+                    _st, _ct, body = fetch_upstream(signed)
+            except Exception as e:  # noqa: BLE001
+                return self._send_json(502, {"ok": False, "kind": "hls",
+                                             "error": "上游播放列表拉取失败: %s" % e}, head=head)
+            text = body.decode("utf-8", "replace")
+            has_seg = any(ln.strip() and not ln.strip().startswith("#") for ln in text.splitlines())
+            if "#EXTM3U" in text and has_seg:
+                return self._send_json(200, {"ok": True, "kind": "hls", "station": title,
+                                             "play": play_url}, head=head)
+            return self._send_json(200, {"ok": False, "kind": "offair", "station": title,
+                                         "error": "该电台当前没有节目"}, head=head)
+
+        # mp3 / 其他直连流：探一小段字节，确认真的能取到音频
+        try:
+            req = urllib.request.Request(signed, headers={"User-Agent": UA, "Range": "bytes=0-2047",
+                                                          "Referer": "https://www.radio.cn/"})
+            with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT) as r:
+                chunk = r.read(2048)
+                ctype = (r.headers.get("Content-Type") or "").lower()
+            if chunk and b"<html" not in chunk[:200].lower():
+                return self._send_json(200, {"ok": True, "kind": "mp3", "station": title,
+                                             "content_type": ctype, "play": play_url}, head=head)
+        except Exception as e:  # noqa: BLE001
+            if DEBUG:
+                log("probe mp3 failed: %s" % e)
+        return self._send_json(200, {"ok": False, "kind": "offair", "station": title,
+                                     "error": "该电台当前没有节目"}, head=head)
 
     # ---- /stations
     def _handle_stations(self, raw_qs: str, head=False):
