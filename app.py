@@ -218,6 +218,12 @@ class Catalog:
             for code, entry in self.items.items():
                 for st in entry["rows"]:
                     src = next((st.get(f) for f in PREFER_FIELDS if st.get(f)), "") or ""
+                    # streams: 每个码率字段的索引文件名，方便按任意 basename 反查
+                    streams = []
+                    for f in PREFER_FIELDS:
+                        b = _basename(st.get(f) or "")
+                        if b and b not in streams:
+                            streams.append(b)
                     out.append({
                         "title": st.get("title"),
                         "contentId": str(st.get("contentId")),
@@ -225,6 +231,7 @@ class Catalog:
                         "provinceCode": code,
                         "subtitle": st.get("subtitle"),
                         "image": st.get("image"),
+                        "streams": streams,
                         "source": src.split("?", 1)[0],
                         "index": _basename(src),
                     })
