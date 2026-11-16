@@ -287,7 +287,12 @@ def resolve_signed_url(target: str):
 _URI_ATTR = re.compile(r'(URI\s*=\s*)"([^"]*)"')
 
 
-def rewrite_playlist(text: str, base: str) -> str:
+def rewrite_playlist(text: str, base: str, relay_prefix: str = "") -> str:
+    def fix(u: str) -> str:
+        absolute = urllib.parse.urljoin(base, u)
+        if relay_prefix:
+            return relay_prefix + "/seg?u=" + urllib.parse.quote(absolute, safe="")
+        return absolute
     out = []
     for line in text.splitlines():
         s = line.strip()
@@ -296,10 +301,10 @@ def rewrite_playlist(text: str, base: str) -> str:
             continue
         if s.startswith("#"):
             def _rep(m):
-                return '%s"%s"' % (m.group(1), urllib.parse.urljoin(base, m.group(2)))
+                return '%s"%s"' % (m.group(1), fix(m.group(2)))
             out.append(_URI_ATTR.sub(_rep, line))
         else:
-            out.append(urllib.parse.urljoin(base, s))
+            out.append(fix(s))
     return "\n".join(out) + "\n"
 
 
@@ -364,6 +369,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_stations(raw_qs, head)
         if path in ("/radio.m3u", "/list.m3u"):
             return self._handle_m3u(raw_qs, head)
+        if path == "/seg":
+            return self._handle_seg(raw_qs, head)
         if path == "/probe":
             return self._handle_probe(raw_qs, head)
         if path in ("/m3u8", "/live", "/hls", "/play"):
@@ -372,7 +379,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- /m3u8
     def _handle_m3u8(self, raw_qs: str, head=False):
-        target, mode = self._parse_m3u8_query(raw_qs)
+        target, mode, relay = self._parse_m3u8_query(raw_qs)
         if not target:
             return self._send_json(400, {
                 "ok": False,
@@ -426,7 +433,10 @@ class Handler(BaseHTTPRequestHandler):
                 "retry_after": 60,
             }, extra={"X-Off-Air": "1", "Cache-Control": "no-store"}, head=head)
 
-        out = rewrite_playlist(text, signed).encode("utf-8")
+        relay_prefix = ""
+        if relay:
+            relay_prefix = "http://" + (self.headers.get("Host") or ("127.0.0.1:%d" % PORT))
+        out = rewrite_playlist(text, signed, relay_prefix).encode("utf-8")
         ctype = "application/vnd.apple.mpegurl"
         if DEBUG:
             log("signed %s -> %s (%s, %d bytes, %.0f ms)"
@@ -442,6 +452,11 @@ class Handler(BaseHTTPRequestHandler):
         """宽松解析: url 里可能带未编码的 & , 所以不能直接用 parse_qs。"""
         mode = "proxy"
         qs = raw_qs
+        relay = False
+        mr = re.search(r"(?:^|&)relay=([01])(?=&|$)", qs)
+        if mr:
+            relay = mr.group(1) == "1"
+            qs = qs[:mr.start()] + qs[mr.end():]
         m = re.search(r"(?:^|&)mode=([A-Za-z]+)(?=&|$)", qs)
         if m:
             mode = m.group(1).lower()
@@ -452,13 +467,61 @@ class Handler(BaseHTTPRequestHandler):
             qs = qs.split("&url=", 1)[1]
         elif qs.startswith("id="):
             qs = qs[3:]
-        return urllib.parse.unquote(qs.strip()), mode
+        return urllib.parse.unquote(qs.strip()), mode, relay
+
+    # ---- /seg：切片中转（浏览器只看到本机地址，不会被 IDM 之类按 .aac/.ts 扩展名劫持）
+    def _handle_seg(self, raw_qs: str, head=False):
+        q = urllib.parse.parse_qs(raw_qs or "")
+        u = (q.get("u") or [""])[0]
+        if not u.lower().startswith(("http://", "https://")):
+            return self._send(400, "缺少 u 参数\n", "text/plain; charset=utf-8", head=head)
+        headers = {"User-Agent": UA, "Referer": "https://www.radio.cn/", "Accept": "*/*"}
+        rng = self.headers.get("Range")
+        if rng:
+            headers["Range"] = rng
+        try:
+            resp = urllib.request.urlopen(urllib.request.Request(u, headers=headers), timeout=UPSTREAM_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            return self._send(e.code, b"", "text/plain; charset=utf-8", head=head)
+        except Exception as e:  # noqa: BLE001
+            log("seg error: %s" % e)
+            return self._send(502, b"", "text/plain; charset=utf-8", head=head)
+
+        ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+        clen = resp.headers.get("Content-Length")
+        try:
+            self.send_response(resp.status)
+            self.send_header("Content-Type", ctype)
+            if clen:
+                self.send_header("Content-Length", clen)
+            else:
+                # 长度未知时明确关连接，避免 HTTP/1.1 keep-alive 卡住播放器
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if head:
+                return
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---- /probe：告诉客户端「这个台现在是 HLS / 直连 mp3 / 没节目」
     # hls.js 需要 m3u8；<audio> 能直接吃 mp3。而浏览器没法从 302 后的跨域响应里读类型，
     # 所以由代理在这里判一次，客户端按 kind 选播放器。
     def _handle_probe(self, raw_qs: str, head=False):
-        target, _mode = self._parse_m3u8_query(raw_qs)
+        target, _mode, _relay = self._parse_m3u8_query(raw_qs)
         if not target:
             return self._send_json(400, {"ok": False, "error": "缺少 url 参数"}, head=head)
         try:
