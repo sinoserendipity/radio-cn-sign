@@ -332,9 +332,9 @@ class Handler(BaseHTTPRequestHandler):
         if not head and body:
             self.wfile.write(body)
 
-    def _send_json(self, code, obj, head=False):
+    def _send_json(self, code, obj, head=False, extra=None):
         self._send(code, json.dumps(obj, ensure_ascii=False, indent=2),
-                   "application/json; charset=utf-8", head=head)
+                   "application/json; charset=utf-8", extra=extra, head=head)
 
     def log_message(self, fmt, *args):  # 精简访问日志
         if LOG_REQUESTS:
@@ -398,18 +398,32 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             status, ctype, body = fetch_upstream(signed)
+            # 未开播的台 CDN 会回 200 + 空 body，重试一次再判死，避免瞬时抖动误杀
+            if not body.strip():
+                time.sleep(0.55)
+                status, ctype, body = fetch_upstream(signed)
         except Exception as e:  # noqa: BLE001
             log("upstream error: %s" % e)
             return self._send_json(502, {"ok": False, "error": "上游播放列表拉取失败: %s" % e,
                                          "url": target}, head=head)
 
         text = body.decode("utf-8", "replace")
-        if "#EXTM3U" in text:
-            out = rewrite_playlist(text, signed).encode("utf-8")
-            ctype = "application/vnd.apple.mpegurl"
-        else:  # 极少数情况:上游直接回了切片或 mp3
-            out = body
-            ctype = ctype or "application/octet-stream"
+        has_segment = any(ln.strip() and not ln.strip().startswith("#") for ln in text.splitlines())
+        if "#EXTM3U" not in text or not has_segment:
+            # 空列表 / 无切片 = 该台当前没在播。返回 502，播放器才能立刻跳下一个，而不是干等。
+            idx = urllib.parse.urlparse(target).path.rsplit("/", 1)[-1]
+            log("off-air: %s (%s) body=%dB" % (title or idx, target, len(body)))
+            return self._send_json(502, {
+                "ok": False,
+                "error": "该电台当前没有节目（未开播或已停播）",
+                "station": title,
+                "index": idx,
+                "resolved": signed.split("?")[0],
+                "retry_after": 60,
+            }, extra={"X-Off-Air": "1", "Cache-Control": "no-store"}, head=head)
+
+        out = rewrite_playlist(text, signed).encode("utf-8")
+        ctype = "application/vnd.apple.mpegurl"
         if DEBUG:
             log("signed %s -> %s (%s, %d bytes, %.0f ms)"
                 % (target, signed.split("?")[0], title, len(out), (time.time() - started) * 1000))
