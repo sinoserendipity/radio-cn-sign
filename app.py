@@ -455,6 +455,8 @@ class Handler(BaseHTTPRequestHandler):
                 "contentId": r["contentId"],
                 "proxy": base + (r["source"] or ("http://ytcast2.radio.cn/" + (r["index"] or ""))),
                 "image": r["image"],
+                "index": r["index"],
+                "streams": r["streams"],
             })
         return self._send_json(200, {"ok": True, "count": len(out), "stations": out}, head=head)
 
