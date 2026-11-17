@@ -16,8 +16,14 @@ services:
       # 由同目录 .env 提供(参考 .env.example); 不要写死在这里, 更不要提交
       SIGN_KEY: "${SIGN_KEY:?set SIGN_KEY in .env}"
       API_BASE: "https://ytmsout.radio.cn"
-      RESIGN_WINDOW: "30"      # 同一频道复用已签地址的最长秒数
+      RESIGN_WINDOW: "120"     # 同一频道复用已签地址的最长秒数(令牌实测有效 ≥45 分钟)
       CATALOG_TTL: "900"       # 频道表全量刷新间隔(秒)
+      # 下面几个用默认值即可, 需要时再放开
+      # BUILD_WAIT: "8"          # 目录构建中单个请求最多等多久(秒), 需小于客户端 12s 超时
+      # BUILD_CONCURRENCY: "8"   # 建目录时的并发抓取数
+      # REBUILD_COOLDOWN: "300"  # 目录失效重建的冷却(秒)
+      # BUILD_RETRY_GAP: "20"    # 建表失败后的重试间隔(秒)
+      # PL_REUSE: "5"            # probe 后复用播放列表的秒数
       LOG_REQUESTS: "1"
     logging:
       driver: json-file

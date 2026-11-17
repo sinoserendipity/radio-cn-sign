@@ -89,7 +89,7 @@ docker load -i radio-cn-sign-amd64.tar.gz     # 或 arm64
 | `/m3u8?url=<带旧令牌的地址>` | 旧地址里的 `?type=1&key=…&time=…` 会被丢掉并重新签，所以**过期的播放列表也能救活** |
 | `/stations` | 全部频道 JSON（含代理地址、台标、省份），`?province=440000` 过滤，`?province=0` 只看央广 |
 | `/radio.m3u` | M3U 订阅（可 `?province=all`），丢进播放器/电视盒子即可 |
-| `/healthz` | 健康检查，含缓存频道数 |
+| `/healthz` | 健康检查，含版本、缓存频道数、目录就绪状态 |
 
 支持未编码的 `&`（`url=http://…?type=1&key=x&time=y` 原样贴进来也能解析）。非 HLS 的直连 mp3 台（如 `stream_11849.mp3`）一律 302 直达，不做缓冲。
 
@@ -100,8 +100,13 @@ docker load -i radio-cn-sign-amd64.tar.gz     # 或 arm64
 | `SIGN_KEY` | （必填） | 网页端接口签名密钥 |
 | `API_BASE` | `https://ytmsout.radio.cn` | 备用网关 `https://ytmsotherout.radio.cn` |
 | `PORT` / `BIND` | `7680` / `0.0.0.0` | 容器内监听 |
-| `RESIGN_WINDOW` | `30` | 同一频道复用已签地址的最长秒数（每次超时就重新请求网关） |
+| `RESIGN_WINDOW` | `120` | 同一频道复用已签地址的最长秒数。超时后**后台**重签，当前请求继续用旧地址（令牌实测有效 ≥45 分钟） |
 | `CATALOG_TTL` | `900` | 全量频道表刷新间隔（32 个地区 × 1 次请求） |
+| `BUILD_WAIT` | `8` | 目录还在构建时，单个请求最多等多久（秒）。需小于客户端探活超时（12s） |
+| `BUILD_CONCURRENCY` | `8` | 建目录时的并发抓取数 |
+| `REBUILD_COOLDOWN` | `300` | 目录疑似失效时全量重建的冷却（秒），防止脏请求反复重建 |
+| `BUILD_RETRY_GAP` | `20` | 建表失败后的重试间隔（秒），上游挂掉时不会每个请求都重试一遍 |
+| `PL_REUSE` | `5` | `/probe` 拉到的播放列表给紧随其后的 `/m3u8` 复用的秒数 |
 | `UPSTREAM_TIMEOUT` | `8` | 上游超时秒数 |
 | `LOG_REQUESTS` | `1` | 访问日志 |
 | `DEBUG` | `0` | 打印每条续签结果 |
@@ -129,6 +134,6 @@ git tag v1.0.0 && git push origin v1.0.0
 
 - **OpenWrt/iStoreOS 上 compose 自建 bridge 通常没有外网**（容器内报 `Connection refused`），所以 `docker-compose.yml` 里写死了 `network_mode: bridge`，别删。
 - 频道是**按索引文件名**（`index_40639.m3u8` / `stream_11849.mp3`）匹配的，官方每个台有 3~4 个不同码率的索引文件，分别对应 `playUrlLow / mp3PlayLow / mp3PlayHigh`，所以贴哪个都能对上号。
-- 目录缓存在容器启动时后台构建（约 2750 个流、32 次请求），`/healthz` 的 `ready` 变 `true` 才好用；没找到的频道会触发一次强制重建再判定 404。
-- 令牌有效期官方没写明，实测至少几分钟；`RESIGN_WINDOW=30` 只是省请求，不影响正确性。
+- 目录缓存在容器启动时后台构建（约 2750 个流、32 次请求，实测 13~15 秒）。构建期间进来的请求**不会被判成 404**：会边等边查，最多等 `BUILD_WAIT` 秒，仍查不到就回 `503 + Retry-After`，目录确实没有这个台才回 404。
+- 令牌有效期官方没写明，实测 **≥45 分钟**；`RESIGN_WINDOW=120` 只是省请求，不影响正确性，超时后是后台重签，不阻塞播放。
 - 服务本身**没有鉴权**，只应暴露在局域网；别在路由器上做 WAN 端口映射，否则等于把签名接口送人。

@@ -33,8 +33,20 @@ API_BASE = (os.environ.get("API_BASE") or "https://ytmsout.radio.cn").rstrip("/"
 PORT = int(os.environ.get("PORT") or 7680)
 BIND = os.environ.get("BIND") or "0.0.0.0"
 CATALOG_TTL = int(os.environ.get("CATALOG_TTL") or 900)   # 全量频道表刷新间隔(秒)
-RESIGN_WINDOW = int(os.environ.get("RESIGN_WINDOW") or 30)  # 同一频道复用已签地址的最长时间(秒)
+# 同一频道复用已签地址的最长时间(秒)。令牌实测有效 ≥45 分钟，原来 30 秒就重签纯属浪费：
+# 每次重签都是一趟跨网 API(0.8~3.0s)，旧值让「同省切台」每半分钟就抖一次。
+RESIGN_WINDOW = int(os.environ.get("RESIGN_WINDOW") or 120)
 UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT") or 8)
+# 冷启动/目录重建时，单个请求最多等多久(秒)。必须小于客户端 probeTimer(12s)，否则先被客户端掐断。
+BUILD_WAIT = float(os.environ.get("BUILD_WAIT") or 8)
+# 建目录时的并发抓取数。上游没有 Workers 那种 6 连接限制，8 并发实测无限流，全量建表 14s -> 9s。
+BUILD_CONCURRENCY = int(os.environ.get("BUILD_CONCURRENCY") or 8)
+# 目录疑似失效时全量重建的冷却(秒)。没有它，一个脏请求就能反复触发 32 省全量重拉。
+REBUILD_COOLDOWN = int(os.environ.get("REBUILD_COOLDOWN") or 300)
+# 构建失败后的重试间隔(秒)。上游挂掉时，不能让每个请求都同步重试一遍 32 个省。
+BUILD_RETRY_GAP = float(os.environ.get("BUILD_RETRY_GAP") or 20)
+# probe 拉到的播放列表，在这段时间内给紧随其后的 /m3u8 复用，省一次上游往返。
+PL_REUSE = float(os.environ.get("PL_REUSE") or 5)
 LOG_REQUESTS = (os.environ.get("LOG_REQUESTS") or "1") not in ("0", "false", "no")
 UA = os.environ.get("UPSTREAM_UA") or (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -43,6 +55,13 @@ UA = os.environ.get("UPSTREAM_UA") or (
 # 优先使用的播放地址字段:高码率 mp3 -> 多码率 -> 低码率 mp3 -> 低码率
 PREFER_FIELDS = ("mp3PlayUrlHigh", "playUrlMulti", "mp3PlayUrlLow", "playUrlLow")
 DEBUG = (os.environ.get("DEBUG") or "0") in ("1", "true", "yes")
+
+VERSION = "radio-cn-sign/2.0"
+BUILD = "2026-11-17T07:20Z"   # 改代码时更新：/healthz 会回显，用来确认跑的是哪一版
+
+
+class CatalogNotReady(Exception):
+    """频道目录还在首次构建中。这是「稍后重试」，不是「这个台不存在」，所以不能回 404。"""
 
 
 def log(*a):
@@ -104,8 +123,12 @@ class Catalog:
         self.items = {}              # code -> {"ts": float, "rows": [station, ...]}
         self.index = {}              # basename -> (code, contentId)
         self.full_ts = 0.0
+        self.rebuilt_ts = 0.0        # 上次「因目录失效而强制重建」的时刻(冷却用)
+        self.tried_ts = 0.0          # 上次「开始建表」的时刻(失败重试间隔用)
         self.ready = threading.Event()
         self.building = False
+        self.refreshing = set()      # 正在后台刷新的省份，避免同一省并发重抓
+        self.last_pl = None          # (signed_url, text, ts) probe 刚拉到的播放列表
 
     # -------- 基础抓取
     def _load_provinces(self):
@@ -130,7 +153,28 @@ class Catalog:
                 for f in PREFER_FIELDS:
                     b = _basename(st.get(f) or "")
                     if b:
-                        self.index.setdefault(b, (code, cid))
+                        # 覆盖写而不是 setdefault：频道换号后旧映射必须能被新数据盖掉，
+                        # 否则索引永远是第一次建表时的快照，后面的「重建自愈」也就无从谈起。
+                        self.index[b] = (code, cid)
+
+    def _refresh_province_async(self, code: str):
+        """后台刷新某省，不阻塞当前请求。旧行先顶着即可：令牌实测有效 ≥45 分钟。"""
+        with self.lock:
+            if code in self.refreshing:
+                return
+            self.refreshing.add(code)
+
+        def work():
+            try:
+                self._refresh_province(code)
+            except Exception as e:  # noqa: BLE001
+                if DEBUG:
+                    log("background refresh %s failed: %s" % (code, e))
+            finally:
+                with self.lock:
+                    self.refreshing.discard(code)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def build(self, force=False):
         with self.lock:
@@ -138,13 +182,18 @@ class Catalog:
                 return
             if not force and self.full_ts and time.time() - self.full_ts < CATALOG_TTL:
                 return
+            # 上一次构建刚失败过就先别再来一遍：上游挂掉时，否则每个请求都要同步重试 32 个省
+            if not force and time.time() - self.tried_ts < BUILD_RETRY_GAP:
+                return
+            self.tried_ts = time.time()
             self.building = True
         try:
-            provs = self.provinces or self._load_provinces()
+            # force 时必须重取省表：radio.cn 新增/改名省份时，沿用旧表会一直漏掉它们。
+            provs = self._load_provinces() if force else (self.provinces or self._load_provinces())
             if not provs:
                 return
             errors = 0
-            sem = threading.Semaphore(6)
+            sem = threading.Semaphore(BUILD_CONCURRENCY)
             threads = []
 
             def work(c):
@@ -172,46 +221,96 @@ class Catalog:
             with self.lock:
                 self.building = False
 
-    def ensure_ready(self):
+    def ensure_ready(self, timeout: float = 0):
         if self.ready.is_set():
-            return
+            return True
         self.build()
+        if not self.ready.is_set() and timeout:
+            return self.ready.wait(timeout)
+        return self.ready.is_set()
 
     # -------- 查询
-    def lookup(self, name: str):
-        """name = index_40639.m3u8 ,返回 (code, contentId)"""
+    def lookup(self, name: str, wait: float = 0):
+        """name = index_40639.m3u8 ,返回 (code, contentId)
+
+        目录还在建的时候不能直接判「不存在」：build() 一旦看到 self.building 就立刻返回，
+        于是冷启动那十几秒里每个请求都拿半成品索引查空 -> 404（实测前 3 次全 404）。
+        这里改成边等边查：目录是增量填充的，通常 2~3 秒就能命中。
+        """
         with self.lock:
             hit = self.index.get(name)
         if hit:
             return hit
         self.ensure_ready()
-        with self.lock:
-            return self.index.get(name)
+        deadline = time.time() + max(wait, 0)
+        while True:
+            with self.lock:
+                hit = self.index.get(name)
+                building = self.building
+            if hit:
+                return hit
+            if not building or time.time() >= deadline:
+                return None
+            time.sleep(0.15)
 
     def station(self, code: str, cid: str):
-        """拿某地区下某频道的记录, 超过 RESIGN_WINDOW 就重抓该地区(即重新签一个新令牌)"""
+        """拿某地区下某频道的记录。
+
+        超过 RESIGN_WINDOW 时后台重抓该省(即重签令牌)，当前请求先用旧行顶着——
+        签名接口要 0.8~3.0s，同步等它没必要，令牌又还有几十分钟寿命。
+        """
         with self.lock:
             entry = self.items.get(code)
-        if not entry or time.time() - entry["ts"] > RESIGN_WINDOW:
-            self._refresh_province(code)
+        if not entry:
+            self._refresh_province(code)          # 该省一次都没抓过，只能同步等
             with self.lock:
                 entry = self.items.get(code)
-        if not entry:
-            return None
-        for st in entry["rows"]:
-            if str(st.get("contentId")) == str(cid):
+        elif time.time() - entry["ts"] > RESIGN_WINDOW:
+            self._refresh_province_async(code)
+        st = self._pick(entry, cid)
+        if st:
+            return st
+        # 频道可能换号/下架, 重建一次索引再找(带冷却, 防止一个脏请求反复全量重建)
+        if self._rebuild_once():
+            with self.lock:
+                entry = self.items.get(code)
+            st = self._pick(entry, cid)
+            if st:
                 return st
-        # 频道可能换号/下架, 重建一次索引再找
-        self.build(force=True)
-        with self.lock:
-            entry = self.items.get(code)
-        for st in (entry or {}).get("rows", []):
+        return None
+
+    @staticmethod
+    def _pick(entry, cid):
+        for st in (entry or {}).get("rows") or []:
             if str(st.get("contentId")) == str(cid):
                 return st
         return None
 
+    def _rebuild_once(self):
+        """目录疑似失效时全量重建；REBUILD_COOLDOWN 秒内只做一次。"""
+        with self.lock:
+            if time.time() - self.rebuilt_ts < REBUILD_COOLDOWN:
+                return False
+            self.rebuilt_ts = time.time()
+            before = self.full_ts
+        self.build(force=True)
+        with self.lock:
+            return self.full_ts != before
+
+    # -------- probe 与 /m3u8 之间的播放列表复用
+    def remember_playlist(self, url: str, text: str):
+        with self.lock:
+            self.last_pl = (url, text, time.time())
+
+    def reuse_playlist(self, url: str):
+        with self.lock:
+            pl = self.last_pl
+        if pl and pl[0] == url and time.time() - pl[2] < PL_REUSE:
+            return pl[1]
+        return None
+
     def all_stations(self):
-        self.ensure_ready()
+        self.ensure_ready(timeout=BUILD_WAIT)
         names = {c: n for c, n in self.provinces}
         out = []
         with self.lock:
@@ -270,8 +369,11 @@ def resolve_signed_url(target: str):
     name = _basename(target)
     if not name:
         raise ValueError("无法从地址中解析出频道索引文件")
-    hit = CATALOG.lookup(name)
+    hit = CATALOG.lookup(name, wait=BUILD_WAIT)
     if not hit:
+        # 目录还没建起来(或正在建) -> 503(稍后重试)；建完了仍然没有 -> 404(这个台确实不在目录里)
+        if CATALOG.building or not CATALOG.ready.is_set():
+            raise CatalogNotReady("频道目录尚未就绪(已等待 %.0fs), 请稍后重试" % BUILD_WAIT)
         raise LookupError("频道索引 %s 未在 radio.cn 目录中找到" % name)
     code, cid = hit
     st = CATALOG.station(code, cid)
@@ -315,7 +417,7 @@ def fetch_upstream(url: str):
 
 # ---------------------------------------------------------------- HTTP 服务
 class Handler(BaseHTTPRequestHandler):
-    server_version = "radio-cn-sign/1.0"
+    server_version = VERSION
     protocol_version = "HTTP/1.1"
 
     # ---- 工具
@@ -358,7 +460,11 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "ready": CATALOG.ready.is_set(),
                 "stations": len(CATALOG.index),
+                "provinces": len(CATALOG.provinces),
                 "api": API_BASE,
+                "version": VERSION,
+                "build": BUILD,
+                "resignWindow": RESIGN_WINDOW,
             }, head=head)
         if path in ("/stations", "/stations.json"):
             return self._handle_stations(raw_qs, head)
@@ -383,6 +489,10 @@ class Handler(BaseHTTPRequestHandler):
         started = time.time()
         try:
             signed, station = resolve_signed_url(target)
+        except CatalogNotReady as e:
+            # 不是「台不存在」, 别回 404：客户端/播放器按 503 稍后重试就行
+            return self._send_json(503, {"ok": False, "error": str(e), "retry_after": 3},
+                                   extra={"Retry-After": "3"}, head=head)
         except LookupError as e:
             return self._send_json(404, {"ok": False, "error": str(e), "url": target}, head=head)
         except ValueError as e:
@@ -400,31 +510,36 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(302, b"", "text/plain; charset=utf-8",
                               {"Location": signed, "Cache-Control": "no-store"}, head=head)
 
-        try:
-            status, ctype, body = fetch_upstream(signed)
-            # 未开播的台 CDN 会回 200 + 空 body，重试一次再判死，避免瞬时抖动误杀
-            if not body.strip():
-                time.sleep(0.55)
+        # probe 刚拉过同一份播放列表的话直接复用，省一次上游往返(客户端拿到 kind 后
+        # 会立刻再来 /m3u8，这趟几乎必然重复)
+        text = CATALOG.reuse_playlist(signed)
+        if text is None:
+            try:
                 status, ctype, body = fetch_upstream(signed)
-        except Exception as e:  # noqa: BLE001
-            log("upstream error: %s" % e)
-            return self._send_json(502, {"ok": False, "error": "上游播放列表拉取失败: %s" % e,
-                                         "url": target}, head=head)
+                # 未开播的台 CDN 会回 200 + 空 body，重试一次再判死，避免瞬时抖动误杀
+                if not body.strip():
+                    time.sleep(0.55)
+                    status, ctype, body = fetch_upstream(signed)
+            except Exception as e:  # noqa: BLE001
+                log("upstream error: %s" % e)
+                return self._send_json(502, {"ok": False, "error": "上游播放列表拉取失败: %s" % e,
+                                             "url": target}, head=head)
 
-        text = body.decode("utf-8", "replace")
-        has_segment = any(ln.strip() and not ln.strip().startswith("#") for ln in text.splitlines())
-        if "#EXTM3U" not in text or not has_segment:
-            # 空列表 / 无切片 = 该台当前没在播。返回 502，播放器才能立刻跳下一个，而不是干等。
-            idx = urllib.parse.urlparse(target).path.rsplit("/", 1)[-1]
-            log("off-air: %s (%s) body=%dB" % (title or idx, target, len(body)))
-            return self._send_json(502, {
-                "ok": False,
-                "error": "该电台当前没有节目（未开播或已停播）",
-                "station": title,
-                "index": idx,
-                "resolved": signed.split("?")[0],
-                "retry_after": 60,
-            }, extra={"X-Off-Air": "1", "Cache-Control": "no-store"}, head=head)
+            text = body.decode("utf-8", "replace")
+            has_segment = any(ln.strip() and not ln.strip().startswith("#") for ln in text.splitlines())
+            if "#EXTM3U" not in text or not has_segment:
+                # 空列表 / 无切片 = 该台当前没在播。返回 502，播放器才能立刻跳下一个，而不是干等。
+                idx = urllib.parse.urlparse(target).path.rsplit("/", 1)[-1]
+                log("off-air: %s (%s) body=%dB" % (title or idx, target, len(body)))
+                return self._send_json(502, {
+                    "ok": False,
+                    "error": "该电台当前没有节目（未开播或已停播）",
+                    "station": title,
+                    "index": idx,
+                    "resolved": signed.split("?")[0],
+                    "retry_after": 60,
+                }, extra={"X-Off-Air": "1", "Cache-Control": "no-store"}, head=head)
+            CATALOG.remember_playlist(signed, text)
 
         out = rewrite_playlist(text, signed).encode("utf-8")
         ctype = "application/vnd.apple.mpegurl"
@@ -463,6 +578,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(400, {"ok": False, "error": "缺少 url 参数"}, head=head)
         try:
             signed, station = resolve_signed_url(target)
+        except CatalogNotReady as e:
+            return self._send_json(503, {"ok": False, "error": str(e), "retry_after": 3},
+                                   extra={"Retry-After": "3"}, head=head)
         except LookupError as e:
             return self._send_json(404, {"ok": False, "error": str(e)}, head=head)
         except Exception as e:  # noqa: BLE001
@@ -484,6 +602,7 @@ class Handler(BaseHTTPRequestHandler):
             text = body.decode("utf-8", "replace")
             has_seg = any(ln.strip() and not ln.strip().startswith("#") for ln in text.splitlines())
             if "#EXTM3U" in text and has_seg:
+                CATALOG.remember_playlist(signed, text)   # 紧接着的 /m3u8 直接复用
                 return self._send_json(200, {"ok": True, "kind": "hls", "station": title,
                                              "play": play_url}, head=head)
             return self._send_json(200, {"ok": False, "kind": "offair", "station": title,
