@@ -1,0 +1,30 @@
+# radio.cn 签名网关 —— Cloudflare Worker
+#
+# 部署：
+#   npx wrangler deploy
+#
+# SIGN_KEY 两种绑法，运行时完全等价（代码读的都是 env.SIGN_KEY）：
+#   A. 控制台点（推荐，不用装命令行）：
+#      Worker → Settings → Variables and Secrets → Add
+#      名称 SIGN_KEY，类型选 Secret，粘贴密钥 → Save and Deploy
+#   B. 命令行：npx wrangler secret put SIGN_KEY
+#
+# 千万不要写进下面被注释掉的 [vars] 再 git push —— 本仓库是公开的，等于公开密钥。
+#
+# 部署完访问一次 https://<name>.<account>.workers.dev/healthz，
+# 看到 ready:true 就能用（静态目录在模块初始化时就位，不需要预热）。
+#
+# 频道目录变动（新增/下线电台）时：
+#   python gen_catalog.py      # 重新抓目录，输出 catalog_data.txt
+#   把内容替换进 _worker.js 的 STATIC_CATALOG，再 deploy
+
+name = "radio-cn-sign"
+main = "_worker.js"
+compatibility_date = "2024-11-01"
+workers_dev = true
+
+# 可选变量，按需打开
+# [vars]
+# API_BASE = "https://ytmsout.radio.cn"
+# RESIGN_WINDOW = "30"
+# DEBUG = "0"
