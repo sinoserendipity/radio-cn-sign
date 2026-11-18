@@ -28,3 +28,5 @@ workers_dev = true
 # API_BASE = "https://ytmsout.radio.cn"
 # RESIGN_WINDOW = "30"
 # DEBUG = "0"
+# ADMIN_TOKEN = "换成你自己的随机串"          # 配了之后 /refresh 必须带 ?token=
+# PASSTHROUGH_HOSTS = ""                      # 允许透传的非 radio.cn 域名，逗号分隔；留空=一个都不放行

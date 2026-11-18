@@ -21,11 +21,13 @@
  *   UPSTREAM_UA     可选，覆盖上游 User-Agent
  *   RESIGN_WINDOW   可选，多少秒后台换一次令牌（不阻塞请求），默认 120
  *   DEBUG           可选，"1" 打开详细日志
+ *   ADMIN_TOKEN     可选，配了之后 /refresh 必须带 ?token=<值>
+ *   PASSTHROUGH_HOSTS 可选，允许透传的非 radio.cn 域名（逗号分隔），默认一个都不放行
  */
 
 const VERSION = "radio-cn-sign/2.0-worker";
 // 每次改代码把这里更新一下：/healthz 会回显，用来确认线上跑的是哪一版
-const BUILD = "2026-11-17T06:04Z";
+const BUILD = "2026-11-18T00:20Z";
 
 // 优先使用的播放地址字段：高码率 mp3 -> 多码率 -> 低码率 mp3 -> 低码率
 const PREFER_FIELDS = ["mp3PlayUrlHigh", "playUrlMulti", "mp3PlayUrlLow", "playUrlLow"];
@@ -109,11 +111,18 @@ function makeSign(params, ts, key) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log("[radio-cn-sign]", ...a);
 
-async function fetchT(url, opts = {}, ms = 8000) {
+/**
+ * 带超时的 fetch。超时必须覆盖到「读完 body」为止，不能只管到响应头：
+ * 上游发完头就卡住（TCP 半开、CDN 限速）是最常见的挂死方式，
+ * 只包住响应头的话请求会一直等到运行时上限，前端那边早就超时了。
+ * 传 read 时在超时窗口内把 body 读成需要的东西再返回。
+ */
+async function fetchT(url, opts = {}, ms = 8000, read = null) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
   try {
-    return await fetch(url, { ...opts, signal: ctrl.signal });
+    const r = await fetch(url, { ...opts, signal: ctrl.signal });
+    return read ? await read(r) : r;
   } finally {
     clearTimeout(timer);
   }
@@ -178,6 +187,20 @@ function looksLikeRadioCn(u) {
   }
 }
 
+// 非 radio.cn 域名的白名单（PASSTHROUGH_HOSTS=a.example.com,b.example.com）。
+// 不配置就一律拒绝——默认必须是关的，见 resolveSignedUrl 里的说明。
+function hostAllowed(env, u) {
+  const list = String(env.PASSTHROUGH_HOSTS || "")
+    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (!list.length) return false;
+  try {
+    const h = new URL(u).hostname.toLowerCase();
+    return list.some((x) => h === x || h.endsWith("." + x));
+  } catch {
+    return false;
+  }
+}
+
 const cfg = (env) => ({
   key: (env.SIGN_KEY || "").trim(),
   api: (env.API_BASE || "https://ytmsout.radio.cn").replace(/\/+$/, ""),
@@ -195,9 +218,11 @@ const store = {
   items: new Map(),    // provinceCode -> { at, rows }
   done: new Set(),     // 已建过索引的 provinceCode
   rebuiltAt: 0,
+  lastBuildAt: 0,      // 上一次「补缺省」重建的时间，自愈节流用
   lastError: "",
   lastPl: null,      // {url, text, at} probe 刚拉到的播放列表，供 /m3u8 复用
-  building: null,
+  building: null,    // 正在进行的目录重建（单飞用）
+  origin: "",        // 当前请求的 origin：Cache API 的键必须与请求同源
 };
 
 // 构建时抓好的频道目录（gen_catalog.py 生成）。
@@ -243,7 +268,7 @@ async function apiGet(env, path, params = "", retries = 2) {
     const ts = String(Date.now());
     const url = c.api + path + (params ? "?" + params : "");
     try {
-      const r = await fetchT(url, {
+      const res = await fetchT(url, {
         headers: {
           sign: makeSign(params, ts, c.key),
           timestamp: ts,
@@ -254,13 +279,12 @@ async function apiGet(env, path, params = "", retries = 2) {
           Accept: "application/json",
         },
         cf: { cacheTtl: 0, cacheEverything: false },
-      }, 8000);
-      const text = await r.text();
+      }, 8000, async (r) => ({ status: r.status, text: await r.text() }));
       let data;
       try {
-        data = JSON.parse(text);
+        data = JSON.parse(res.text);
       } catch {
-        throw new Error("接口返回非 JSON（HTTP " + r.status + "）");
+        throw new Error("接口返回非 JSON（HTTP " + res.status + "）");
       }
       if (data.code !== 0 && data.code != null) {
         throw new Error("api code=" + data.code + " message=" + data.message);
@@ -288,12 +312,22 @@ async function loadProvinces(env, force = false) {
   return provs;
 }
 
-async function refreshProvince(env, code, ctx) {
-  const data = await apiGet(env, "/web/appBroadcast/list", "categoryId=0&provinceCode=" + code);
+// retries：批量重建时必须传 0。apiGet 默认每个请求最多试 3 次，
+// 32 个省 × 3 = 96 个子请求，免费版单次调用只有 50 个额度——一超限后面全失败，
+// 表现就是 /refresh 只补回 26/32。单省路径仍然保留重试。
+// writeCache：批量重建时必须传 false。Cache API 的 put()/match()/delete() 与 fetch()
+// **共享同一个子请求配额**（免费版 50），所以「每省 fetch + put」= 2 次 × 32 省 = 64，
+// 一定撞上限——这才是 /refresh 长期只补回 25~26 个省的真正原因。
+// 省缓存只是冷启动优化，真实播放流量会照常写入，重建时跳过不影响播放。
+async function refreshProvince(env, code, ctx, retries = 2, writeCache = true) {
+  const data = await apiGet(env, "/web/appBroadcast/list", "categoryId=0&provinceCode=" + code, retries);
   const rows = data.data || [];
   const entry = { at: Date.now(), rows };
   store.items.set(code, entry);
-  writeProvinceCache(code, entry, ctx);   // 不 await，写缓存失败不影响本次请求
+  // 有 ctx 就交给 waitUntil（不阻塞本次请求）；没有 ctx 时必须自己 await，
+  // 否则请求一结束这个 put 会被运行时直接丢掉，缓存永远写不进去。
+  const cacheP = writeCache ? writeProvinceCache(code, entry, ctx) : null;
+  if (cacheP && !(ctx && typeof ctx.waitUntil === "function")) await cacheP;
   for (const st of rows) {
     const cid = String(st.contentId);
     for (const f of PREFER_FIELDS) {
@@ -323,57 +357,130 @@ async function readProvinceCache(code) {
 }
 
 function writeProvinceCache(code, entry, ctx) {
-  if (typeof caches === "undefined" || !store.origin) return;
+  if (typeof caches === "undefined" || !store.origin) return null;
   const p = caches.default.put(provKey(code), new Response(
     JSON.stringify({ at: entry.at, rows: entry.rows }),
     { headers: { "Content-Type": "application/json", "Cache-Control": "max-age=1800" } }
   )).catch(() => { /* 写不进去就算了 */ });
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
+  return p;
 }
 
 // 运行时兜底：静态目录里没有的 basename（新上线/换号的台）才走这里，
 // 把各省列表重新抓一遍补进索引。正常播放路径一次都不会跑。
 // 并发 6：Cloudflare 单次调用最多 6 条并发出站连接，再多也只是排队。
+// 某省列表连续抓失败时退避，别让每次播放列表刷新都重打一次上游：
+// 30s / 1min / 2min / 4min …… 封顶 10min。成功一次就清零。
+const provFail = new Map();   // provinceCode -> { n, nextAt }
+const inBackoff = (code) => {
+  const f = provFail.get(code);
+  return !!(f && f.nextAt > Date.now());
+};
+function noteProvFail(code) {
+  const n = ((provFail.get(code) || {}).n || 0) + 1;
+  provFail.set(code, { n, nextAt: Date.now() + Math.min(600000, 30000 * 2 ** (n - 1)) });
+}
+const noteProvOk = (code) => { if (provFail.size) provFail.delete(code); };
+
 async function buildIndex(env, force = false) {
-  if (force) store.done.clear();
   const provs = await loadProvinces(env, force);
   if (force) store.provinces = provs;
-  const queue = provs.map((p) => p[0]).filter((c) => !store.done.has(c));
-  if (!queue.length) return;
+  // force 时全部重拉，否则只补还没建过的。
+  // 注意：不要清空 store.done——它表示「这个省成功拉过一次」。清空之后只要有一个省
+  // 部分失败，/healthz 的 ready 就会变 false，而静态目录其实一直是完整的。
+  const queue = provs.map((p) => p[0]).filter((c) => force || !store.done.has(c));
+  if (!queue.length) return [];
+  const attempted = queue.length;
 
-  let errors = 0;
+  const failed = new Map();   // code -> 错误信息（回给 /refresh 用来看清到底为什么失败）
+  const deadline = Date.now() + 25000;   // 整轮 25s 预算，剩下的留给下次，别撞运行时上限
+  // 子请求硬预算。免费版每次调用 50 个，且 Cache API 的 put/match 与 fetch **共享**这个额度。
+  // 批量路径每省只花 1 次 fetch（不写省缓存），32 省 + 8 次重试 = 40，加 loadProvinces 1 次共 41。
+  // 自己先卡住，比让运行时抛 "Too many subrequests" 好排查——那时候一半省已经失败了。
+  let subreq = 0;
+  const SUBREQ_MAX = 40;
   const worker = async () => {
     while (queue.length) {
+      if (Date.now() > deadline) return;   // 没轮到的留在 queue 里
+      if (subreq >= SUBREQ_MAX) return;
       const code = queue.shift();
+      subreq++;
       try {
-        await refreshProvince(env, code);
+        // 批量路径：不吃 apiGet 重试（retries=0），也不写省缓存（writeCache=false）
+        await refreshProvince(env, code, undefined, 0, false);
         store.done.add(code);
+        noteProvOk(code);
       } catch (e) {
-        errors++;
-        if (cfg(env).debug) log("province " + code + " failed: " + e.message);
+        failed.set(code, (e && e.message) || String(e));
+        noteProvFail(code);
       }
+      // 稍微摊开一点：32 个请求全挤在同一秒打同一台接口，边缘节点容易直接拒掉几个
+      if (queue.length) await sleep(150);
     }
   };
+  // 并发 6 = Cloudflare 单次调用允许的最大并发出站连接数，再多只会排队。
+  // （之前降到 4 是因为「6 并发时总有几个省被拒」，那个现象的真因其实是子请求配额被
+  //  Cache API 的 put 吃掉了一半，跟并发数无关；现在批量路径不写缓存了，可以放开。）
   await Promise.all(Array.from({ length: Math.min(6, queue.length) }, worker));
-  log("目录重建: " + store.done.size + "/" + provs.length + " 个地区, "
-      + store.index.size + " 个索引, 失败 " + errors);
+
+  // 第二轮：把第一轮失败的省串行重试一次（同样不吃 apiGet 重试、不写缓存）。
+  for (const code of [...failed.keys()].slice(0, 8)) {
+    if (Date.now() > deadline + 3000) break;
+    if (subreq >= SUBREQ_MAX) break;
+    await sleep(400);
+    subreq++;
+    try {
+      await refreshProvince(env, code, undefined, 0, false);
+      store.done.add(code);
+      noteProvOk(code);
+      failed.delete(code);
+    } catch { /* 保留第一次的错误信息 */ }
+  }
+
+  // 时间预算内没轮到的，明说，不要装作成功（也不记失败，免得吃退避）
+  for (const code of queue) failed.set(code, "本次时间预算内没轮到，再点一次即可");
+  queue.length = 0;
+
+  const still = [...failed].map(([code, error]) => ({ code, error: error.slice(0, 120) }));
+  log("目录重建: " + (attempted - still.length) + "/" + attempted + " 个地区本次成功, "
+      + store.index.size + " 个索引, 未补回 " + still.length);
+  return still;
 }
 
 const isComplete = () =>
   store.provinces.length > 0 && store.done.size >= store.provinces.length;
 
+// 单飞：ensureIndex / refreshIndexOnce / /refresh 都走这里，同一时刻只允许一次全量重建。
+// 否则两个并发请求会各建一遍（33×2 个子请求），免费版 50 的上限直接被撞穿，两边都失败。
+function buildOnce(env, force = true) {
+  if (store.building) return store.building;
+  store.lastBuildAt = Date.now();
+  const p = buildIndex(env, force).finally(() => { store.building = null; });
+  store.building = p;
+  return p;
+}
+
+// 自愈：/refresh 强制重建时只要有省没补回来，done 就小于 provinces，ready 变 false。
+// 而同实例不会自己再建（ensureIndex 只在 index 为空时才动手），要等下一个 isolate
+// 冷启动从静态目录读回 done=32 才会恢复——中间这段时间 /healthz 一直报 false。
+// 所以在 /healthz 上顺手补一次缺省：force=false，只拉缺的那几个省，子请求很少。
+// 60 秒节流 + store.building 单飞，不会把额度打光。
+function selfHeal(env, ctx) {
+  if (isComplete() || store.building) return;
+  if (Date.now() - store.lastBuildAt < 60000) return;
+  const p = buildOnce(env, false).catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
+}
+
 // 静态目录在模块初始化时已经填好，正常路径到这里直接返回 true
 async function ensureIndex(env) {
   if (store.index.size) return true;
-  if (store.building) {
-    try { await store.building; } catch { /* 下面统一看结果 */ }
-    return store.index.size > 0;
-  }
-  store.building = buildIndex(env, true).catch((e) => {
+  try {
+    await buildOnce(env, true);
+  } catch (e) {
     store.lastError = (e && e.message) || String(e);
     log("buildIndex failed: " + store.lastError);
-  }).finally(() => { store.building = null; });
-  await store.building;
+  }
   return store.index.size > 0;
 }
 
@@ -385,7 +492,7 @@ async function refreshIndexOnce(env, staleName) {
   store.rebuiltAt = Date.now();
   if (staleName) store.index.delete(staleName);
   try {
-    await buildIndex(env, true);
+    await buildOnce(env, true);
     return true;
   } catch (e) {
     store.lastError = (e && e.message) || String(e);
@@ -402,10 +509,12 @@ function lookupIndex(name) {
 // 同时让 waitUntil 去换新的。否则每 RESIGN_WINDOW 秒就有一次 2~3 秒的卡顿。
 const refreshing = new Set();
 function refreshProvinceAsync(env, code, ctx) {
-  if (refreshing.has(code)) return;
+  // 正在换，或者刚失败过还在退避窗口里：继续用旧令牌（它能活 45 分钟），别重打上游
+  if (refreshing.has(code) || inBackoff(code)) return;
   refreshing.add(code);
   const p = refreshProvince(env, code, ctx)
-    .catch(() => { /* 后台失败就继续用旧令牌 */ })
+    .then(() => noteProvOk(code))
+    .catch(() => noteProvFail(code))
     .finally(() => refreshing.delete(code));
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
 }
@@ -455,7 +564,15 @@ async function resolveSignedUrl(env, target, ctx) {
     else if (t.startsWith("index_")) t = "http://ytcast2.radio.cn/" + t;
     else throw new HttpError(400, "url 参数不是合法地址");
   }
-  if (!looksLikeRadioCn(t)) return [t, null];
+  if (!looksLikeRadioCn(t)) {
+    // 非 radio.cn 一律拒绝：放行的话这个网关等于开放重定向（mode=redirect 会 302 到任意地址）
+    // 加半个开放代理（.m3u8 会被 Worker 拉回来转发），谁都能拿它当跳板、吃你的出站流量。
+    // 确实要放行别的域名，用环境变量 PASSTHROUGH_HOSTS 列主机名（逗号分隔）。
+    if (!hostAllowed(env, t)) {
+      throw new HttpError(400, "只支持 radio.cn 的地址（要放行别的域名请配置 PASSTHROUGH_HOSTS）");
+    }
+    return [t, null];
+  }
 
   const name = basename(t);
   if (!name) throw new HttpError(400, "无法从地址中解析出频道索引文件");
@@ -520,7 +637,7 @@ function absUrl(u, base) {
 }
 
 async function fetchUpstream(env, url, extraHeaders = {}) {
-  const r = await fetchT(url, {
+  return fetchT(url, {
     headers: {
       "User-Agent": cfg(env).ua,
       Accept: "*/*",
@@ -528,8 +645,11 @@ async function fetchUpstream(env, url, extraHeaders = {}) {
       ...extraHeaders,
     },
     cf: { cacheTtl: 0, cacheEverything: false },
-  }, 8000);
-  return { status: r.status, ctype: r.headers.get("Content-Type") || "", body: await r.text() };
+  }, 8000, async (r) => ({
+    status: r.status,
+    ctype: r.headers.get("Content-Type") || "",
+    body: await r.text(),
+  }));
 }
 
 const hasSegment = (text) =>
@@ -550,16 +670,33 @@ function sendJson(obj, status = 200, headers = {}) {
 
 // 宽松解析：url 里可能带未编码的 &，所以不能直接用 URLSearchParams
 function parseTarget(rawQs) {
-  let mode = "proxy";
   let qs = rawQs || "";
-  const m = qs.match(/(?:^|&)mode=([A-Za-z]+)(?=&|$)/);
-  if (m) {
-    mode = m[1].toLowerCase();
-    qs = qs.slice(0, m.index) + qs.slice(m.index + m[0].length);
+  let mode = "proxy";
+
+  // ① 前缀写法 ?mode=redirect&url=... —— 唯一无歧义的写法，优先认它
+  const mHead = qs.match(/^mode=([A-Za-z]+)(?:&|$)/);
+  if (mHead) {
+    mode = mHead[1].toLowerCase();
+    qs = qs.slice(mHead[0].length);
   }
+
   if (qs.startsWith("url=")) qs = qs.slice(4);
-  else if (qs.includes("&url=")) qs = qs.split("&url=")[1];
+  else if (qs.includes("&url=")) qs = qs.slice(qs.indexOf("&url=") + 5);
   else if (qs.startsWith("id=")) qs = qs.slice(3);
+
+  // ② 后缀写法 ?url=...&mode=redirect
+  // 但地址本身也可能带 &mode=（例如 ?url=http://a/x.m3u8?y=1&mode=loop），那种不能剥，
+  // 否则会把地址改坏、还顺手把网关切到 redirect。判据：地址没自带查询串，
+  // 或者地址是百分号编码过的（那时内部的 & 一定是 %26，不会有歧义）。
+  const mTail = qs.match(/&mode=([A-Za-z]+)$/);
+  if (mode === "proxy" && mTail) {
+    const head = qs.slice(0, mTail.index);
+    if (/%[0-9a-f]{2}/i.test(head) || !head.includes("?")) {
+      mode = mTail[1].toLowerCase();
+      qs = head;
+    }
+  }
+
   let target = qs.trim();
   try { target = decodeURIComponent(target); } catch { /* 保留原样 */ }
   return [target, mode];
@@ -687,8 +824,13 @@ async function handleProbe(env, url, rawQs, ctx) {
       Referer: "https://www.radio.cn/",
     }, 2048, 8000);
     const ctype = (r.ctype || "").toLowerCase();
-    const head = new TextDecoder().decode(r.buf.slice(0, 200)).toLowerCase();
-    if (r.buf.length && !head.includes("<html")) {
+    const head = new TextDecoder().decode(r.buf.slice(0, 200)).trimStart().toLowerCase();
+    // 光判「不是 HTML」不够：上游回 403 的 JSON / 纯文本也会被当成可播，
+    // 播放器接着报错、再走一遍 offair。音频流要么 content-type 是 audio/*（或 octet-stream），
+    // 要么至少开头不像 HTML/JSON 文本。
+    const audioType = /^audio\//.test(ctype) || ctype.includes("octet-stream") || ctype === "";
+    const texty = head.startsWith("<") || head.startsWith("{") || head.startsWith("[");
+    if (r.buf.length && audioType && !texty) {
       return sendJson({ ok: true, kind: "mp3", station: title, content_type: ctype, play: playUrl });
     }
   } catch (e) {
@@ -697,14 +839,36 @@ async function handleProbe(env, url, rawQs, ctx) {
   return sendJson({ ok: false, kind: "offair", station: title, error: "该电台当前没有节目" });
 }
 
+// 只补 store.items 里还没有的省，不整个重建。并发 6（Cloudflare 单次调用最多 6 条并发出站连接）。
+async function ensureProvinces(env) {
+  const queue = store.provinces.map((p) => p[0])
+    .filter((c) => !store.items.has(c) && !inBackoff(c));
+  if (!queue.length) return;
+  const worker = async () => {
+    while (queue.length) {
+      const code = queue.shift();
+      try { await refreshProvince(env, code); noteProvOk(code); }
+      catch { noteProvFail(code); }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(6, queue.length) }, worker));
+}
+
 async function allStations(env, prov = "") {
   if (!(await ensureIndex(env))) throw new Error("频道目录构建失败");
   // 静态目录只带 basename 映射，不含频道详情，所以列表接口得现拉。
-  // 指定了省就只拉那个省（1 个请求），要全量才拉 32 个。
+  // 指定了省就只拉那个省（1 个请求）。
   if (prov && prov !== "all") {
-    if (!store.items.has(prov)) await refreshProvince(env, prov);
-  } else if (store.items.size < store.provinces.length) {
-    await buildIndex(env, true);
+    // 注意：这里不能受退避窗口影响。用户点名要这个省，就必须真去拉；
+    // 拉不到要报错，而不是跳过之后返回一个 count:0 的空列表（看起来像「这个省没有台」）。
+    if (!store.items.has(prov)) {
+      try { await refreshProvince(env, prov); noteProvOk(prov); }
+      catch (e) { noteProvFail(prov); throw e; }
+    }
+  } else {
+    // 原来这里是 buildIndex(force=true)：32 个省全重拉，只要有一个省长期失败，
+    // 每次 /stations 都是 33 个子请求。改成只补缺的。
+    await ensureProvinces(env);
   }
   const names = new Map(store.provinces);
   const out = [];
@@ -724,7 +888,7 @@ async function allStations(env, prov = "") {
         subtitle: st.subtitle,
         image: st.image,
         streams,
-        source: src.split("?")[0],
+        source: src,          // 保留完整地址：有的 mp3 带 token，切掉查询串就是 403
         index: basename(src),
       });
     }
@@ -755,7 +919,7 @@ async function handleStations(env, url, rawQs) {
       title: r.title,
       province: r.province,
       contentId: r.contentId,
-      proxy: base + (r.source || "http://ytcast2.radio.cn/" + (r.index || "")),
+      proxy: base + quote(r.source || "http://ytcast2.radio.cn/" + (r.index || "")),
       image: r.image,
       index: r.index,
       streams: r.streams,
@@ -785,7 +949,7 @@ async function handleM3u(env, url, rawQs) {
       '#EXTINF:-1 tvg-name="' + (r.title || "") + '" tvg-logo="' + (r.image || "") +
       '" group-title="' + (r.province || "") + '",' + (r.title || "")
     );
-    lines.push(base + (r.source || "http://ytcast2.radio.cn/" + r.index));
+    lines.push(base + quote(r.source || "http://ytcast2.radio.cn/" + r.index));
   }
   return send(lines.join("\n") + "\n", 200, {
     "Content-Type": "audio/x-mpegurl; charset=utf-8",
@@ -803,6 +967,36 @@ code{background:#f3f3f3;padding:2px 5px;border-radius:4px}</style>
 <a href="/healthz">/healthz</a> 健康检查</p>`;
 
 // ---------------------------------------------------------------- 入口
+// /refresh 的冷却。模块变量只在当前 isolate 里有效，而 Cloudflare 会把请求分到不同实例
+// （实测连着两次都各自跑完了全量重建），所以再往 Cache API 里存一份，同机房共享。
+let lastRefreshAt = 0;
+const REFRESH_COOLDOWN = 60000;
+const refreshKey = () => (store.origin || "https://radio-cn-sign.invalid") + "/__refresh_at";
+
+async function refreshCoolingDown() {
+  if (Date.now() - lastRefreshAt < REFRESH_COOLDOWN) return true;
+  if (typeof caches === "undefined" || !store.origin) return false;
+  try {
+    const hit = await caches.default.match(refreshKey());
+    if (!hit) return false;
+    const j = await hit.json();
+    return Date.now() - Number(j.at || 0) < REFRESH_COOLDOWN;
+  } catch {
+    return false;
+  }
+}
+
+async function markRefresh() {
+  lastRefreshAt = Date.now();
+  if (typeof caches === "undefined" || !store.origin) return;
+  try {
+    await caches.default.put(refreshKey(), new Response(
+      JSON.stringify({ at: Date.now() }),
+      { headers: { "Content-Type": "application/json", "Cache-Control": "max-age=120" } }
+    ));
+  } catch { /* 写不进去就只靠实例内的 lastRefreshAt */ }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -830,6 +1024,7 @@ export default {
       if (path === "/" || path === "/index.html") {
         res = send(INDEX_HTML, 200, { "Content-Type": "text/html; charset=utf-8" });
       } else if (path === "/healthz") {
+        selfHeal(env, ctx);
         res = sendJson({
           ok: true,
           ready: isComplete(),
@@ -845,22 +1040,35 @@ export default {
       } else if (path === "/refresh") {
         // 强制重抓 32 个省的目录（约 30 个请求 / 10 秒）。
         // 平时用不着：静态目录查不到的台会自动兜底重建。发现某台长期失效时可以手动点一次。
-        const t0 = Date.now();
-        let ok = false;
-        try {
-          await buildIndex(env, true);
-          ok = true;
-        } catch (e) {
-          store.lastError = (e && e.message) || String(e);
+        // 但这一下就是 33 个子请求，必须挡：配了 ADMIN_TOKEN 就校验 ?token=，
+        // 没配也至少给 60 秒冷却，别让人拿着它把额度刷光。
+        const tok = String(env.ADMIN_TOKEN || "");
+        if (tok && new URLSearchParams(rawQs).get("token") !== tok) {
+          res = sendJson({ ok: false, error: "需要 ?token=<ADMIN_TOKEN>" }, 403);
+        } else if (await refreshCoolingDown()) {
+          res = sendJson({ ok: false, error: "60 秒内只能刷新一次" }, 429);
+        } else {
+          await markRefresh();
+          const t0 = Date.now();
+          let ok = false, still = [];
+          try {
+            still = (await buildOnce(env, true)) || [];
+            ok = true;
+          } catch (e) {
+            store.lastError = (e && e.message) || String(e);
+          }
+          res = sendJson({
+            ok,
+            stations: store.index.size,
+            done: store.done.size,      // 累计建过索引的省数，不因本轮失败而减少
+            failed: still.length ? still : undefined,
+            ms: Date.now() - t0,
+            error: ok ? undefined : store.lastError,
+            hint: still.length
+              ? "有 " + still.length + " 个地区这次没补回来，failed 里带各自的错误信息；过一分钟再点一次即可，播放不受影响"
+              : "重抓后的结果只存在当前实例内存里，要长期生效请跑 gen_catalog.py 重新生成静态目录",
+          });
         }
-        res = sendJson({
-          ok,
-          stations: store.index.size,
-          provinces: store.done.size,
-          ms: Date.now() - t0,
-          error: ok ? undefined : store.lastError,
-          hint: "重抓后的结果只存在当前实例内存里，要长期生效请跑 gen_catalog.py 重新生成静态目录",
-        });
       } else if (path === "/warm") {
         // 预热目录表。免费版 10ms CPU 一次可能建不完，重复访问几次即可（断点续建）。
         const ok = await ensureIndex(env);
