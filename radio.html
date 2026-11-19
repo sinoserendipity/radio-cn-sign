@@ -150,6 +150,10 @@
   .badge{display:inline-flex;align-items:center;gap:6px;font-size:calc(11px * var(--fs));letter-spacing:.6px;
     color:var(--mint);font-weight:600}
   .badge i{width:5px;height:5px;border-radius:50%;background:var(--mint)}
+  /* 已播时长：贴在状态后面。tabular-nums 是为了秒数跳动时宽度不抖，
+     aria-hidden 见 HTML —— 每秒变一次的数字不能让读屏跟着念 */
+  .badge .elapsed{font-variant-numeric:tabular-nums;font-weight:500;color:var(--mint);opacity:.72}
+  .badge .elapsed:not([hidden])::before{content:"·";margin-right:5px;opacity:.6;font-weight:400}
   .badge.on i{box-shadow:0 0 0 3px #AECBA633;animation:pulse 2s var(--ease) infinite}
   @keyframes pulse{0%,100%{box-shadow:0 0 0 0 #AECBA633}50%{box-shadow:0 0 0 5px #0000}}
   /* 台名用衬线：广播有报纸的基因，和全 sans 的界面形成一处对比就够了。
@@ -658,7 +662,7 @@
       <img class="art miss" id="art" alt="">
       <span class="art-ph" id="artph">广</span>
       <div class="meta">
-        <div class="badge" id="badge" role="status" aria-live="polite"><i></i><span id="badgeText">待播放</span></div>
+        <div class="badge" id="badge" role="status" aria-live="polite"><i></i><span id="badgeText">待播放</span><span class="elapsed" id="elapsed" hidden aria-hidden="true"></span></div>
         <h1 id="np">选一个电台</h1>
         <div class="sub" id="sub">空格播放 · ↑↓ 换台</div>
       </div>
@@ -1000,6 +1004,45 @@ $("#badge").addEventListener("pointerup", () => clearTimeout(holdTimer));
 $("#badge").addEventListener("pointerleave", () => clearTimeout(holdTimer));
 
 /* ── 状态 ─────────────────────────────────────────── */
+/* 已播时长：直播流没有可信的总时长 —— HLS 的 audio.duration 只有滑动窗口那么长（50~60 秒），
+   换台还会归零，拿它当「播了多久」是错的。所以按真实播放时间自己累加：
+   只在 playing 时走表，暂停就停住但保留数值，换台才清零。 */
+let elBase = 0, elStart = 0, elTimer = 0;
+function elNow(){ return elBase + (elStart ? (Date.now() - elStart) / 1000 : 0); }
+function elFmt(sec){
+  const s = Math.floor(sec);
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), r = s % 60;
+  const p = n => String(n).padStart(2, "0");
+  return h ? h + ":" + p(m) + ":" + p(r) : p(m) + ":" + p(r);
+}
+function elPaint(){
+  const box = $("#elapsed");
+  if (!box) return;
+  const n = elNow();
+  // 不足 1 秒不显示，免得刚点播放就闪一下 00:00
+  if (n < 1){ box.hidden = true; return; }
+  box.hidden = false;
+  const t = elFmt(n);
+  if (box.textContent !== t) box.textContent = t;
+}
+function elResume(){
+  if (!elStart) elStart = Date.now();
+  if (!elTimer) elTimer = setInterval(elPaint, 1000);
+  elPaint();
+}
+function elPause(){
+  if (elStart){ elBase += (Date.now() - elStart) / 1000; elStart = 0; }
+  elPaint();
+}
+function elReset(){
+  elBase = 0; elStart = 0;
+  clearInterval(elTimer); elTimer = 0;
+  const box = $("#elapsed");
+  if (box){ box.hidden = true; box.textContent = ""; }
+}
+// 切到后台时 interval 会被节流，回来立刻按时间戳重算一次，别显示过期数字
+document.addEventListener("visibilitychange", () => { if (!document.hidden && elStart) elPaint(); });
+
 function setBadge(text, live){
   $("#badgeText").textContent = text;
   $("#badge").classList.toggle("on", !!live);
@@ -1314,6 +1357,8 @@ function setLoading(s){
 function play(s, manual, keepRetry){
   if (!keepRetry) altTried = false;
   if (!s) return;
+  // 换台才清零；同一个台重连（backoff 里的 play(cur,false,true)）要接着算
+  if (!cur || cur.id !== s.id) elReset();
   if (manual) skipStreak = 0;
   cur = s;
   if (!keepRetry) retry = 0;
@@ -1947,10 +1992,12 @@ audio.addEventListener("error", () => {
 });
 audio.addEventListener("pause", () => {
   playing = false; $("#hero").classList.remove("playing"); syncCards();
+  elPause();
   if (!connecting && cur) setBadge("已暂停", false);   // 暂停后别一直挂着「正在直播」
 });
 audio.addEventListener("playing", () => {
   playing = true; $("#hero").classList.add("playing"); setBadge("正在直播", true); syncCards();
+  elResume();
   if (cur && "mediaSession" in navigator)
     navigator.mediaSession.metadata = new MediaMetadata({ title: cur.name, artist: "radio.cn", album: cur.group });
 });
